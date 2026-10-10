@@ -37,6 +37,13 @@ function formatDuration(sec) {
   return `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
+function formatFileSize(bytes) {
+  if (!bytes || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1).replace(/\.0$/, '')} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1).replace(/\.0$/, '')} MB`;
+}
+
 // Robust clipboard copy helper with native macOS pbcopy guarantee
 async function copyToClipboard(text) {
   if (!text) return false;
@@ -98,10 +105,17 @@ async function fetchData(isManual = false) {
   try {
     const conversationId = sidecar.conversationId || null;
     let workspaceUri = null;
-    if (sidecar.getWorkspaceUris) {
-      const uris = await sidecar.getWorkspaceUris().catch(() => []);
-      if (uris && uris.length > 0) {
-        workspaceUri = uris[0];
+    if (sidecar && sidecar.getWorkspaceUris) {
+      try {
+        const uris = await Promise.race([
+          sidecar.getWorkspaceUris(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 800)),
+        ]);
+        if (uris && uris.length > 0) {
+          workspaceUri = uris[0];
+        }
+      } catch {
+        // Fallback gracefully on timeout or error
       }
     }
 
@@ -363,12 +377,26 @@ function renderGit(git) {
   } else {
     listEl.innerHTML = displayFiles.map((f) => {
       let statusClass = 'color: var(--text-main)';
-      if (f.status.includes('M')) statusClass = 'color: var(--color-warning)';
-      if (f.status.includes('A') || f.status === '??') statusClass = 'color: var(--color-success)';
-      if (f.status.includes('D') || f.status.includes('U')) statusClass = 'color: var(--color-danger)';
+      const st = f.status || '';
+      if (f.isConflict || st.includes('U') || st === 'AA' || st === 'DD' || st === 'AU' || st === 'UA' || st === 'DU' || st === 'UD') {
+        statusClass = 'color: var(--color-danger); font-weight: 700;';
+      } else if (st.startsWith('R') || st.includes('->')) {
+        statusClass = 'color: var(--color-warning);';
+      } else if (f.isStaged && f.isModified) {
+        statusClass = 'color: var(--color-warning);';
+      } else if (f.isStaged) {
+        statusClass = 'color: var(--color-success);';
+      } else if (st.includes('D')) {
+        statusClass = 'color: var(--color-danger);';
+      } else if (f.isModified || st.includes('M')) {
+        statusClass = 'color: var(--color-warning);';
+      } else if (f.isUntracked || st === '??') {
+        statusClass = 'color: var(--color-success);';
+      }
+      const displayName = f.oldFile ? `${f.file} (← ${f.oldFile})` : f.file;
       return `<div class="file-row">
-        <span class="file-status" style="${statusClass}">${f.status}</span>
-        <span class="file-name" title="${f.file}">${f.file}</span>
+        <span class="file-status" style="${statusClass}">${st}</span>
+        <span class="file-name" title="${f.file}">${displayName}</span>
       </div>`;
     }).join('');
     listEl.scrollTop = prevScrollTop;
@@ -500,15 +528,19 @@ function renderTools(conv) {
   const recentEl = $('recent-tools');
   const prevScroll = recentEl.scrollTop;
   if (conv.recentTools && conv.recentTools.length > 0) {
-    recentEl.innerHTML = conv.recentTools.map((t) => `
-      <div class="tool-row">
-        <span class="tool-name">${t.name}</span>
-        <span class="tool-summary" title="${t.summary || t.action}">${t.summary || t.action}</span>
-      </div>
-    `).join('');
+    recentEl.innerHTML = conv.recentTools.map((t) => {
+      const actionText = String(t.action || t.name).replace(/^["']|["']$/g, '').trim();
+      const summaryText = String(t.summary || actionText).replace(/^["']|["']$/g, '').trim();
+      return `
+        <div class="tool-row">
+          <span class="tool-name">${escapeHtml(t.name)}</span>
+          <span class="tool-summary" title="${escapeHtml(summaryText)}">${escapeHtml(summaryText)}</span>
+        </div>
+      `;
+    }).join('');
     recentEl.scrollTop = prevScroll;
   } else {
-    recentEl.innerHTML = '';
+    recentEl.innerHTML = '<div style="color: var(--text-muted); font-size: 11px; padding: 4px;">暂无工具调用记录</div>';
   }
 }
 
@@ -584,8 +616,7 @@ async function openImageModal(artifact) {
 
   nameEl.textContent = artifact.name || '图片预览';
   nameEl.title = artifact.path || '';
-  const sizeKB = Math.round((artifact.size || 0) / 1024);
-  sizeEl.textContent = `${sizeKB} KB`;
+  sizeEl.textContent = formatFileSize(artifact.size);
 
   imgEl.src = '';
   imgEl.style.display = 'none';
@@ -660,7 +691,7 @@ function renderArtifacts(conv) {
 
   el.innerHTML = artifacts.map((a, idx) => {
     const icon = getArtifactIcon(a);
-    const sizeKB = Math.round((a.size || 0) / 1024);
+    const sizeFormatted = formatFileSize(a.size);
     const summary = a.summary ? `<span style="font-size: 10px; color: var(--text-muted); margin-left: 4px;">(${escapeHtml(a.summary)})</span>` : '';
     const clickTitle = a.isImage ? `点击在看板内查看预览: ${escapeHtml(a.name)}` : `点击使用系统默认程序打开: ${escapeHtml(a.path)}`;
     return `
@@ -670,7 +701,7 @@ function renderArtifacts(conv) {
           <span class="artifact-name">${escapeHtml(a.name)}${summary}</span>
         </div>
         <div class="artifact-meta">
-          <span class="artifact-size">${sizeKB} KB</span>
+          <span class="artifact-size">${sizeFormatted}</span>
           <button class="btn-copy-path" data-path="${escapeHtml(a.path)}" title="复制文件完整路径">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
             <span>路径</span>

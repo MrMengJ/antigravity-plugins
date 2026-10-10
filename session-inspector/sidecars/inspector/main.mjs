@@ -32,30 +32,193 @@ app.api('/styles.css', () => new Response(readLocal('styles.css'), {
 // In-memory stats cache: conversationId -> { mtime, size, data }
 const statsCache = new Map();
 
-// Helper to find latest conversation directory if none provided
-function getFallbackConversationId() {
+// Safe workspace path normalizer (handles file:// URIs safely across platforms)
+function normalizeWorkspace(ws) {
+  if (!ws || typeof ws !== 'string') return null;
+  if (ws.startsWith('file://')) {
+    try {
+      return fileURLToPath(ws);
+    } catch {
+      return decodeURIComponent(ws.replace(/^file:\/\//, ''));
+    }
+  }
+  return resolve(ws);
+}
+
+// Helper to find latest conversation directory matching the requested workspace
+function getFallbackConversationId(requestedWorkspace = null) {
   const brainDir = join(homedir(), '.gemini', 'antigravity', 'brain');
   if (!existsSync(brainDir)) return null;
   try {
     const entries = readdirSync(brainDir, { withFileTypes: true });
-    let latestId = null;
-    let latestMtime = 0;
+    const candidates = [];
     for (const entry of entries) {
       if (entry.isDirectory() && !entry.name.startsWith('.')) {
         const transcriptPath = join(brainDir, entry.name, '.system_generated', 'logs', 'transcript.jsonl');
         if (existsSync(transcriptPath)) {
-          const mtime = statSync(transcriptPath).mtimeMs;
-          if (mtime > latestMtime) {
-            latestMtime = mtime;
-            latestId = entry.name;
-          }
+          try {
+            const mtime = statSync(transcriptPath).mtimeMs;
+            candidates.push({ id: entry.name, transcriptPath, mtime });
+          } catch {}
         }
       }
     }
-    return latestId;
+    candidates.sort((a, b) => b.mtime - a.mtime);
+
+    const normReq = normalizeWorkspace(requestedWorkspace);
+
+    // Filter to separate main user conversations from background subagents
+    const userCandidates = [];
+    for (const c of candidates) {
+      try {
+        const head = readFileSync(c.transcriptPath, 'utf8').slice(0, 4096);
+        const isSubagent = head.includes('"SYSTEM_MESSAGE"') && head.includes('<SYSTEM_MESSAGE>');
+        if (!isSubagent) {
+          userCandidates.push(c);
+        }
+      } catch {}
+    }
+
+    const candidatePool = userCandidates.length > 0 ? userCandidates : candidates;
+
+    if (normReq) {
+      for (const c of candidatePool) {
+        try {
+          const rawHead = readFileSync(c.transcriptPath, 'utf8').slice(0, 65536);
+          if (rawHead.includes(normReq)) {
+            return c.id;
+          }
+          const wsMatch = rawHead.match(/Active Workspaces:\s*\n-\s*([^\n\r]+)/);
+          if (wsMatch && normalizeWorkspace(wsMatch[1].trim()) === normReq) {
+            return c.id;
+          }
+        } catch {}
+      }
+    }
+
+    // Crucial fallback: If no candidate specifically matched the workspace path,
+    // return the most recent user conversation rather than returning null!
+    return candidatePool.length > 0 ? candidatePool[0].id : null;
   } catch (err) {
     console.error('[sidecar] Error finding fallback conversation:', err.message);
     return null;
+  }
+}
+
+// Helper to scan artifacts in conversation directory (includes root, .user_uploaded, and .tempmediaStorage)
+function scanArtifacts(brainDir) {
+  if (!brainDir || !existsSync(brainDir)) return [];
+  const artifacts = [];
+  const scanned = new Set();
+
+  function tryAdd(filePath, defaultSummary = '') {
+    if (scanned.has(filePath)) return;
+    scanned.add(filePath);
+    try {
+      const st = statSync(filePath);
+      if (!st.isFile()) return;
+      const fileName = basename(filePath);
+      let summary = defaultSummary;
+      const metaPath = join(dirname(filePath), `${fileName}.metadata.json`);
+      if (existsSync(metaPath)) {
+        try {
+          const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+          summary = meta.summary || meta.description || summary;
+        } catch {}
+      }
+      artifacts.push({
+        name: fileName,
+        path: filePath,
+        size: st.size,
+        mtime: st.mtimeMs,
+        summary,
+        isImage: /\.(png|jpg|jpeg|gif|webp|svg|bmp|ico)$/i.test(fileName),
+        isMarkdown: /\.(md|markdown|mdx)$/i.test(fileName),
+      });
+    } catch {}
+  }
+
+  // 1. Root artifacts
+  try {
+    const entries = readdirSync(brainDir, { withFileTypes: true });
+    for (const ent of entries) {
+      if (!ent.name.startsWith('.') && ent.isFile() && !ent.name.endsWith('.metadata.json')) {
+        tryAdd(join(brainDir, ent.name));
+      }
+    }
+  } catch {}
+
+  // 2. User uploaded files
+  const userUploadsDir = join(brainDir, '.user_uploaded');
+  if (existsSync(userUploadsDir)) {
+    try {
+      const uploadEntries = readdirSync(userUploadsDir, { withFileTypes: true });
+      for (const ent of uploadEntries) {
+        if (!ent.name.startsWith('.') && ent.isFile() && !ent.name.endsWith('.metadata.json')) {
+          tryAdd(join(userUploadsDir, ent.name), '用户上传媒体文件');
+        }
+      }
+    } catch {}
+  }
+
+  // 3. Generated media snapshots (.tempmediaStorage)
+  const tempMediaDir = join(brainDir, '.tempmediaStorage');
+  if (existsSync(tempMediaDir)) {
+    try {
+      const mediaEntries = readdirSync(tempMediaDir, { withFileTypes: true });
+      for (const ent of mediaEntries) {
+        if (!ent.name.startsWith('.') && ent.isFile() && !ent.name.endsWith('.metadata.json')) {
+          tryAdd(join(tempMediaDir, ent.name), '会话快照与媒体文件');
+        }
+      }
+    } catch {}
+  }
+
+  artifacts.sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+  return artifacts;
+}
+
+// Memory files scan and estimation
+function scanMemoryFiles() {
+  const memoryDir = join(homedir(), '.agents/memory');
+  const memoryFiles = [];
+  let memoryBytes = 0;
+  if (existsSync(memoryDir)) {
+    try {
+      const mEntries = readdirSync(memoryDir, { withFileTypes: true });
+      for (const ent of mEntries) {
+        if (ent.isFile() && ent.name.endsWith('.md')) {
+          try {
+            const sz = statSync(join(memoryDir, ent.name)).size;
+            memoryBytes += sz;
+            memoryFiles.push({ name: ent.name, size: sz, tokens: Math.round(sz / 3.2) });
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+  const globalAgentsMd = join(homedir(), '.agents/AGENTS.md');
+  if (existsSync(globalAgentsMd)) {
+    try {
+      const sz = statSync(globalAgentsMd).size;
+      memoryBytes += sz;
+      memoryFiles.push({ name: 'AGENTS.md', size: sz, tokens: Math.round(sz / 3.2) });
+    } catch {}
+  }
+  return { memoryFiles, memoryBytes };
+}
+
+// Check configured MCP count in global mcp_config.json
+function getConfiguredMcpServersCount() {
+  const mcpConfigPath = join(homedir(), '.gemini', 'config', 'mcp_config.json');
+  if (!existsSync(mcpConfigPath)) return 0;
+  try {
+    const raw = readFileSync(mcpConfigPath, 'utf8');
+    const json = JSON.parse(raw);
+    const servers = json.mcpServers || {};
+    return Object.keys(servers).length;
+  } catch {
+    return 0;
   }
 }
 
@@ -73,7 +236,10 @@ function parseConversationStats(conversationId) {
     const fileStat = statSync(transcriptPath);
     const cached = statsCache.get(conversationId);
     if (cached && cached.mtime === fileStat.mtimeMs && cached.size === fileStat.size) {
-      return cached.data;
+      return {
+        ...cached.data,
+        artifacts: scanArtifacts(brainDir),
+      };
     }
 
     const rawContent = readFileSync(transcriptPath, 'utf8').trim();
@@ -119,24 +285,30 @@ function parseConversationStats(conversationId) {
     for (let i = 0; i < lines.length; i++) {
       const step = lines[i];
 
-      // Detect workspace from system/user messages or tool calls
-      if (!detectedWorkspacePath) {
-        if (step.content && typeof step.content === 'string') {
-          const wsMatch = step.content.match(/Active Workspaces:\s*\n-\s*([^\n\r]+)/);
-          if (wsMatch) {
-            detectedWorkspacePath = wsMatch[1].trim();
-          }
+      // Detect workspace dynamically (priority: spec.workspaceUris > Active Workspaces in content > tool Cwd)
+      if (Array.isArray(step.spec?.workspaceUris) && step.spec.workspaceUris.length > 0) {
+        const rawUri = step.spec.workspaceUris[0];
+        try {
+          detectedWorkspacePath = rawUri.startsWith('file://') ? fileURLToPath(rawUri) : decodeURIComponent(rawUri);
+        } catch {
+          detectedWorkspacePath = rawUri.replace(/^file:\/\//, '');
         }
-        if (Array.isArray(step.tool_calls)) {
-          for (const call of step.tool_calls) {
-            if (call.args?.Cwd) {
-              detectedWorkspacePath = String(call.args.Cwd).replace(/^["']|["']$/g, '');
+      }
+      if (step.content && typeof step.content === 'string') {
+        const wsMatch = step.content.match(/Active Workspaces:\s*\n-\s*([^\n\r]+)/);
+        if (wsMatch) {
+          detectedWorkspacePath = wsMatch[1].trim();
+        }
+      }
+      if (!detectedWorkspacePath && Array.isArray(step.tool_calls)) {
+        for (const call of step.tool_calls) {
+          if (call.args?.Cwd) {
+            const rawCwd = String(call.args.Cwd).replace(/^["']|["']$/g, '');
+            if (!rawCwd.startsWith('/tmp') && !rawCwd.startsWith('/private/tmp')) {
+              detectedWorkspacePath = rawCwd;
               break;
             }
           }
-        }
-        if (Array.isArray(step.spec?.workspaceUris) && step.spec.workspaceUris.length > 0) {
-          detectedWorkspacePath = step.spec.workspaceUris[0].replace(/^file:\/\//, '');
         }
       }
 
@@ -157,13 +329,18 @@ function parseConversationStats(conversationId) {
             skillsUsed.add(skillMatch[1].replace(/_/g, '-'));
           }
 
-          // Detect slash commands only inside USER_REQUEST
+          // Detect slash commands only inside USER_REQUEST (must be followed by space or end of line, not slash)
           const userReqMatch = step.content.match(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/);
           const userText = userReqMatch ? userReqMatch[1] : step.content;
-          const slashMatches = userText.matchAll(/^\/([a-zA-Z0-9_\-]+)/gm);
+          const slashMatches = userText.matchAll(/^\/([a-zA-Z0-9_\-]+)(?:\s|$)/gm);
+          const sysPathsBlacklist = new Set([
+            'help', 'exit', 'quit', 'Users', 'Applications', 'Volumes',
+            'System', 'Library', 'bin', 'usr', 'etc', 'opt', 'tmp',
+            'var', 'private', 'home', 'dev', 'sbin', 'root',
+          ]);
           for (const sm of slashMatches) {
             const cmd = sm[1].replace(/_/g, '-');
-            if (cmd !== 'help' && cmd !== 'exit' && cmd !== 'quit' && cmd !== 'Users' && cmd !== 'Applications') {
+            if (!sysPathsBlacklist.has(cmd)) {
               skillsUsed.add(cmd);
             }
           }
@@ -184,12 +361,12 @@ function parseConversationStats(conversationId) {
         totalOutput += outTok;
         totalCache += cacheTok;
 
-        // Calculate actual generation time: from current step to next step
-        if (outTok > 0 && i < lines.length - 1 && lines[i + 1].created_at) {
+        // Calculate actual generation time: from previous step completion to current model completion
+        if (outTok > 0 && i > 0 && lines[i - 1]?.created_at) {
+          const prevTime = new Date(lines[i - 1].created_at).getTime();
           const curTime = new Date(step.created_at).getTime();
-          const nextTime = new Date(lines[i + 1].created_at).getTime();
-          const durSec = (nextTime - curTime) / 1000;
-          if (durSec >= 0.5 && durSec <= 180) {
+          const durSec = (curTime - prevTime) / 1000;
+          if (durSec >= 0.2 && durSec <= 120) {
             totalGenDurationSec += durSec;
             totalGenTokens += outTok;
             latestGenSpeed = Math.round(outTok / durSec);
@@ -201,22 +378,40 @@ function parseConversationStats(conversationId) {
             const tName = call.name || 'unknown';
             toolCounts[tName] = (toolCounts[tName] || 0) + 1;
 
-            if (tName === 'view_file' && call.args?.AbsolutePath?.includes('/skills/')) {
-              const sm = call.args.AbsolutePath.match(/\/skills\/([a-zA-Z0-9_\-]+)\//);
+            if (tName === 'view_file' && call.args?.AbsolutePath) {
+              const absP = String(call.args.AbsolutePath).replace(/^["']|["']$/g, '');
+              const sm = absP.match(/[\\/]skills[\\/]([a-zA-Z0-9_\-]+)[\\/]/);
               if (sm) skillsUsed.add(sm[1].replace(/_/g, '-'));
             }
 
-            if (tName.startsWith('mcp_') || tName.startsWith('mcp__')) {
+            // MCP detection: check prefix or non-builtin tool names
+            const builtinToolNames = new Set([
+              'view_file', 'write_to_file', 'replace_file_content', 'run_command',
+              'schedule', 'manage_task', 'manage_subagents', 'invoke_subagent',
+              'send_message', 'read_url_content', 'search_web', 'generate_image',
+              'list_plugin_accounts', 'ask_question', 'list_dir', 'find_by_name',
+              'grep_search',
+            ]);
+            if (tName.startsWith('mcp_') || tName.startsWith('mcp__') || (!builtinToolNames.has(tName) && (tName.includes('__') || tName.includes('_mcp')))) {
               mcpsUsed.add(tName);
             }
 
-            if (recentToolCalls.length < 20) {
-              recentToolCalls.push({
-                name: tName,
-                action: call.args?.toolAction || tName,
-                summary: call.args?.toolSummary || '',
-                time: step.created_at || '',
-              });
+            // Rolling buffer of the latest 20 tool calls with cleaned arguments
+            const cleanAction = call.args?.toolAction
+              ? String(call.args.toolAction).replace(/^["']|["']$/g, '').trim()
+              : tName;
+            const cleanSummary = call.args?.toolSummary
+              ? String(call.args.toolSummary).replace(/^["']|["']$/g, '').trim()
+              : (call.args?.CommandLine ? String(call.args.CommandLine).replace(/^["']|["']$/g, '').slice(0, 45) : '');
+
+            recentToolCalls.push({
+              name: tName,
+              action: cleanAction,
+              summary: cleanSummary,
+              time: step.created_at || '',
+            });
+            if (recentToolCalls.length > 20) {
+              recentToolCalls.shift();
             }
           }
         }
@@ -297,106 +492,31 @@ function parseConversationStats(conversationId) {
       ? Math.round(totalGenTokens / totalGenDurationSec)
       : latestGenSpeed;
 
-    // Artifacts in brain directory
-    const artifacts = [];
-    try {
-      const artifactEntries = readdirSync(brainDir, { withFileTypes: true });
-      for (const ent of artifactEntries) {
-        if (!ent.name.startsWith('.') && ent.isFile() && !ent.name.endsWith('.metadata.json')) {
-          const filePath = join(brainDir, ent.name);
-          const st = statSync(filePath);
-          let summary = '';
-          const metaPath = join(brainDir, `${ent.name}.metadata.json`);
-          if (existsSync(metaPath)) {
-            try {
-              const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
-              summary = meta.summary || meta.description || '';
-            } catch {
-              // ignore
-            }
-          }
-          artifacts.push({
-            name: ent.name,
-            path: filePath,
-            size: st.size,
-            mtime: st.mtimeMs,
-            summary,
-            isImage: /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(ent.name),
-            isMarkdown: /\.md$/i.test(ent.name),
-          });
-        }
-      }
-    } catch {
-      // ignore
-    }
-
-    // Check user uploaded files as well
-    const userUploadsDir = join(brainDir, '.user_uploaded');
-    if (existsSync(userUploadsDir)) {
-      try {
-        const uploadEntries = readdirSync(userUploadsDir, { withFileTypes: true });
-        for (const ent of uploadEntries) {
-          if (!ent.name.startsWith('.') && ent.isFile() && !ent.name.endsWith('.metadata.json')) {
-            const filePath = join(userUploadsDir, ent.name);
-            const st = statSync(filePath);
-            artifacts.push({
-              name: ent.name,
-              path: filePath,
-              size: st.size,
-              mtime: st.mtimeMs,
-              summary: '用户上传媒体文件',
-              isImage: /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(ent.name),
-              isMarkdown: /\.md$/i.test(ent.name),
-            });
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    artifacts.sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+    // Scan artifacts dynamically (including root, .user_uploaded, and .tempmediaStorage)
+    const artifacts = scanArtifacts(brainDir);
 
     // Memory files scan and estimation
-    const memoryDir = join(homedir(), '.agents/memory');
-    const memoryFiles = [];
-    let memoryBytes = 0;
-    if (existsSync(memoryDir)) {
-      try {
-        const mEntries = readdirSync(memoryDir, { withFileTypes: true });
-        for (const ent of mEntries) {
-          if (ent.isFile() && ent.name.endsWith('.md')) {
-            const sz = statSync(join(memoryDir, ent.name)).size;
-            memoryBytes += sz;
-            memoryFiles.push({ name: ent.name, size: sz, tokens: Math.round(sz / 3.2) });
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }
-    const globalAgentsMd = join(homedir(), '.agents/AGENTS.md');
-    if (existsSync(globalAgentsMd)) {
-      try {
-        const sz = statSync(globalAgentsMd).size;
-        memoryBytes += sz;
-        memoryFiles.push({ name: 'AGENTS.md', size: sz, tokens: Math.round(sz / 3.2) });
-      } catch {
-        // ignore
-      }
-    }
-
-    const memoryTokens = Math.max(1000, Math.round(memoryBytes / 3.2));
-    const systemPromptTokens = 6000;
-    const systemToolsTokens = 16700;
-    const skillsTokens = 9900;
-    const mcpTokens = mcpsUsed.size > 0 ? mcpsUsed.size * 3000 : 0;
+    const { memoryFiles, memoryBytes } = scanMemoryFiles();
+    const memoryTokens = Math.round(memoryBytes / 3.2);
+    const systemPromptTokens = 3500;
+    const systemToolsTokens = 7500;
+    const skillsTokens = Math.max(1200, skillsUsed.size * 1500);
+    const mcpServersCount = getConfiguredMcpServersCount();
+    const mcpTokens = mcpServersCount * 2000;
     const autocompactBufferTokens = 33000;
     const contextLimit = 1000000; // 1M for Gemini Flash/Pro
 
     const winTokens = Math.min(contextLimit, Math.max(0, currentContextWindowTokens > 0 ? currentContextWindowTokens : (lastTurnInput + lastTurnCache)));
-    const fixedTokens = systemPromptTokens + systemToolsTokens + memoryTokens + skillsTokens + mcpTokens;
-    const messagesTokens = Math.max(0, winTokens - fixedTokens);
+    const nominalFixed = systemPromptTokens + systemToolsTokens + memoryTokens + skillsTokens + mcpTokens;
+    let actualFixed = nominalFixed;
+    let messagesTokens = 0;
+    if (winTokens <= nominalFixed) {
+      const ratio = winTokens > 0 ? winTokens / nominalFixed : 0;
+      actualFixed = Math.round(nominalFixed * ratio * 0.85);
+      messagesTokens = Math.max(0, winTokens - actualFixed);
+    } else {
+      messagesTokens = winTokens - nominalFixed;
+    }
     const freeTokens = Math.max(0, contextLimit - winTokens - autocompactBufferTokens);
 
     const contextWindow = {
@@ -474,6 +594,10 @@ function parseConversationStats(conversationId) {
       size: fileStat.size,
       data,
     });
+    if (statsCache.size > 30) {
+      const oldestKey = statsCache.keys().next().value;
+      statsCache.delete(oldestKey);
+    }
 
     return data;
   } catch (err) {
@@ -491,7 +615,7 @@ function parseGitInfo(workspacePath) {
     try {
       targetDir = fileURLToPath(targetDir);
     } catch {
-      // fallback
+      targetDir = decodeURIComponent(targetDir.replace(/^file:\/\//, ''));
     }
   }
 
@@ -518,33 +642,36 @@ function parseGitInfo(workspacePath) {
   };
 
   try {
-    const isGit = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], gitOptions).trim() === 'true';
+    const isGit = execFileSync('git', ['-c', 'core.quotepath=false', 'rev-parse', '--is-inside-work-tree'], gitOptions).trim() === 'true';
     if (!isGit) return { isGit: false, path: targetDir };
 
     let branch = '';
     try {
-      branch = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], gitOptions).trim();
-    } catch {
+      branch = execFileSync('git', ['-c', 'core.quotepath=false', 'symbolic-ref', '--short', 'HEAD'], gitOptions).trim();
+    } catch {}
+    if (!branch) {
       try {
-        branch = execFileSync('git', ['branch', '--show-current'], gitOptions).trim();
+        branch = execFileSync('git', ['-c', 'core.quotepath=false', 'branch', '--show-current'], gitOptions).trim();
+      } catch {}
+    }
+    if (!branch) {
+      try {
+        branch = execFileSync('git', ['-c', 'core.quotepath=false', 'rev-parse', '--short', 'HEAD'], gitOptions).trim() + ' (detached)';
       } catch {
-        try {
-          branch = execFileSync('git', ['rev-parse', '--short', 'HEAD'], gitOptions).trim() + ' (detached)';
-        } catch {
-          branch = 'HEAD (new repo)';
-        }
+        branch = 'HEAD (new repo)';
       }
     }
 
     let currentWorktree = '主工作区 (默认)';
     let isLinkedWorktree = false;
     try {
-      const gitDir = execFileSync('git', ['rev-parse', '--git-dir'], gitOptions).trim();
-      if (gitDir.includes('/worktrees/') || gitDir.includes('\\worktrees\\')) {
+      const gitDir = resolve(targetDir, execFileSync('git', ['-c', 'core.quotepath=false', 'rev-parse', '--git-dir'], gitOptions).trim());
+      const commonDir = resolve(targetDir, execFileSync('git', ['-c', 'core.quotepath=false', 'rev-parse', '--git-common-dir'], gitOptions).trim());
+      if (gitDir !== commonDir) {
         isLinkedWorktree = true;
         currentWorktree = basename(gitDir);
       } else {
-        const wtListRaw = execFileSync('git', ['worktree', 'list', '--porcelain'], gitOptions);
+        const wtListRaw = execFileSync('git', ['-c', 'core.quotepath=false', 'worktree', 'list', '--porcelain'], gitOptions);
         const count = (wtListRaw.match(/^worktree /gm) || []).length;
         if (count > 1) {
           currentWorktree = `主工作区 (共 ${count} 个)`;
@@ -565,19 +692,24 @@ function parseGitInfo(workspacePath) {
     const changedFiles = [];
 
     try {
-      // Use core.quotepath=false so Chinese characters are not escaped
       const statusRaw = execFileSync('git', ['-c', 'core.quotepath=false', 'status', '--porcelain'], gitOptions);
       const lines = statusRaw.split('\n').filter(Boolean);
       for (const line of lines) {
         const x = line[0];
         const y = line[1];
         const rawFile = line.slice(3).trim();
-        const file = rawFile.includes(' -> ') ? rawFile.split(' -> ')[1] : rawFile;
+        let file = rawFile;
+        let oldFile = null;
+        if (rawFile.includes(' -> ')) {
+          const parts = rawFile.split(' -> ');
+          oldFile = parts[0];
+          file = parts[1];
+        }
 
         const isConflict = (x === 'U' || y === 'U' || (x === 'A' && y === 'A') || (x === 'D' && y === 'D'));
         const isUntracked = (x === '?' && y === '?');
-        const isStaged = !isConflict && !isUntracked && (x !== ' ');
-        const isModified = !isConflict && !isUntracked && (y !== ' ');
+        const isStaged = !isConflict && !isUntracked && (x !== ' ' && x !== '?');
+        const isModified = !isConflict && !isUntracked && (y !== ' ' && y !== '?');
 
         if (isConflict) conflict++;
         if (isStaged) staged++;
@@ -586,8 +718,9 @@ function parseGitInfo(workspacePath) {
         if (x === 'D' || y === 'D') deleted++;
 
         changedFiles.push({
-          status: (x + y).trim(),
+          status: x + y,
           file,
+          oldFile,
           isStaged,
           isModified,
           isUntracked,
@@ -600,9 +733,14 @@ function parseGitInfo(workspacePath) {
 
     let diffStat = '';
     try {
-      diffStat = execFileSync('git', ['diff', '--shortstat'], gitOptions).trim();
+      diffStat = execFileSync('git', ['-c', 'core.quotepath=false', 'diff', 'HEAD', '--shortstat'], gitOptions).trim();
+      if (!diffStat) {
+        diffStat = execFileSync('git', ['-c', 'core.quotepath=false', 'diff', '--shortstat'], gitOptions).trim();
+      }
     } catch {
-      // ignore
+      try {
+        diffStat = execFileSync('git', ['-c', 'core.quotepath=false', 'diff', '--cached', '--shortstat'], gitOptions).trim();
+      } catch {}
     }
 
     return {
@@ -628,12 +766,13 @@ function parseGitInfo(workspacePath) {
 app.api('/api/inspect', (data) => {
   const query = data || {};
   let conversationId = query.conversationId;
+  const requestedWorkspace = normalizeWorkspace(query.workspacePath || null);
   if (!conversationId) {
-    conversationId = getFallbackConversationId();
+    conversationId = getFallbackConversationId(requestedWorkspace);
   }
 
   const conversationStats = parseConversationStats(conversationId);
-  const workspacePath = query.workspacePath || conversationStats?.workspacePath || null;
+  const workspacePath = requestedWorkspace || conversationStats?.workspacePath || null;
   const gitStats = parseGitInfo(workspacePath);
 
   return {
@@ -652,12 +791,13 @@ function resolveSafeArtifactPath(conversationId, targetPath) {
 
   if (conversationId && conversationId.length >= 8) {
     const convBrain = join(brainBase, conversationId);
-    if (target.startsWith(convBrain)) {
+    if (target === convBrain || target.startsWith(convBrain + '/') || target.startsWith(convBrain + '\\')) {
       return target;
     }
+    return null;
   }
 
-  if (target.startsWith(brainBase)) {
+  if (target === brainBase || target.startsWith(brainBase + '/') || target.startsWith(brainBase + '\\')) {
     return target;
   }
   return null;
