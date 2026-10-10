@@ -1,0 +1,5 @@
+{
+  "name": "session-inspector",
+  "description": "实时查看当前会话的 Token 消耗、速度、缓存命中、工具与技能调用及 Git 代码状态看板。",
+  "logo": "assets/logo.svg"
+}

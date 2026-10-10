@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>会话看板</title>
+  <link rel="stylesheet" href="/styles.css?v=20261011i">
+  <script src="/preload.js"></script>
+</head>
+<body>
+  <div class="inspector-app">
+    <!-- Header -->
+    <header class="header">
+      <div class="title-group">
+        <span class="title">会话看板</span>
+        <span id="model-badge" class="badge">Gemini Flash</span>
+      </div>
+      <div class="actions">
+        <button id="btn-refresh" class="btn-icon" title="刷新当前会话数据">
+          <svg class="refresh-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 2v6h-6"></path>
+            <path d="M3 12a9 9 0 0 1 15.36-6.36L21 8"></path>
+            <path d="M3 22v-6h6"></path>
+            <path d="M21 12a9 9 0 0 1-15.36 6.36L3 16"></path>
+          </svg>
+          <span>刷新</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Overview Pills: Elapsed time & Token Speed -->
+    <div class="overview-bar">
+      <div class="metric-pill">
+        <div class="metric-label">⏱️ 会话运行时长</div>
+        <div id="stat-elapsed" class="metric-val">--:--:--</div>
+      </div>
+      <div class="metric-pill">
+        <div class="metric-label">⚡ Token 速度</div>
+        <div id="stat-speed" class="metric-val">-- tok/s</div>
+      </div>
+    </div>
+
+    <!-- Card 1: Tokens Consumption & Cache Hit -->
+    <section class="card">
+      <div class="card-header">
+        <div class="card-title">📊 Token 消耗与缓存</div>
+        <div class="mode-toggle">
+          <button id="toggle-total" class="toggle-btn active">累计</button>
+          <button id="toggle-latest" class="toggle-btn">最新轮</button>
+        </div>
+      </div>
+
+      <!-- Main Requirement Format Banner -->
+      <div class="token-banner-box">
+        <div id="token-banner-text" class="token-formula">Tokens 0 (in: 0, out: 0, cache: 0)</div>
+        <div id="token-banner-desc" class="token-subtext">占百万上下文容量约 0%</div>
+      </div>
+
+      <!-- Breakdown Grid -->
+      <div class="token-breakdown">
+        <div class="breakdown-item">
+          <div class="breakdown-label">输入 (in)</div>
+          <div id="val-input" class="breakdown-value">0</div>
+        </div>
+        <div class="breakdown-item">
+          <div class="breakdown-label">输出 (out)</div>
+          <div id="val-output" class="breakdown-value">0</div>
+        </div>
+        <div class="breakdown-item">
+          <div class="breakdown-label">缓存 (cache)</div>
+          <div id="val-cache" class="breakdown-value">0</div>
+        </div>
+      </div>
+
+      <!-- Cache Hit Rate Bar -->
+      <div class="cache-bar-wrapper">
+        <div class="cache-bar-header">
+          <span>缓存命中率</span>
+          <span id="cache-rate-text" style="color: var(--color-success, #16a34a); font-weight: 600;">0%</span>
+        </div>
+        <div class="cache-bar-track">
+          <div id="cache-bar-fill" class="cache-bar-fill" style="width: 0%;"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Card: Context Window Breakdown -->
+    <section class="card" id="card-context-window">
+      <div class="card-header" id="context-header" style="cursor: pointer;" title="点击折叠/展开明细">
+        <div class="card-title">🪟 上下文窗口</div>
+        <div class="context-header-stats">
+          <span id="ctx-health-badge" class="ctx-health-badge healthy">健康</span>
+          <span id="ctx-summary-text" class="context-summary-val">-- / 1M (0%)</span>
+          <span class="ctx-chevron-icon" aria-hidden="true">
+            <svg id="ctx-toggle-arrow" class="toggle-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+          </span>
+        </div>
+      </div>
+
+      <!-- Segmented Multi-Color Progress Bar -->
+      <div class="context-segmented-bar" id="ctx-segmented-bar">
+        <div class="seg seg-messages" id="seg-messages" style="width: 0%;" title="Messages"></div>
+        <div class="seg seg-system-tools" id="seg-system-tools" style="width: 0%;" title="System tools"></div>
+        <div class="seg seg-memory" id="seg-memory" style="width: 0%;" title="Memory files"></div>
+        <div class="seg seg-mcp" id="seg-mcp" style="width: 0%;" title="MCP tools"></div>
+        <div class="seg seg-skills" id="seg-skills" style="width: 0%;" title="Skills"></div>
+        <div class="seg seg-prompt" id="seg-prompt" style="width: 0%;" title="System prompt"></div>
+        <div class="seg seg-autocompact" id="seg-autocompact" style="width: 0%;" title="Autocompact buffer"></div>
+      </div>
+
+      <!-- Compaction & Retained Turns Status Strip -->
+      <div class="context-compaction-bar" id="ctx-compaction-bar">
+        <div class="compaction-item">
+          <span class="compaction-label">压缩状态</span>
+          <span class="compaction-val" id="ctx-compaction-val">检查中...</span>
+        </div>
+        <div class="compaction-item">
+          <span class="compaction-label">保留交互</span>
+          <span class="compaction-val" id="ctx-retained-turns-val">--</span>
+        </div>
+      </div>
+
+      <!-- Items Breakdown List -->
+      <div class="context-breakdown-list" id="ctx-breakdown-list">
+        <div class="ctx-item">
+          <div class="ctx-item-left">
+            <span class="ctx-dot" style="background: #3b82f6;"></span>
+            <span class="ctx-label">Messages</span>
+          </div>
+          <div class="ctx-item-right">
+            <span class="ctx-tokens" id="ctx-val-messages">--</span>
+            <span class="ctx-percent" id="ctx-pct-messages">--%</span>
+          </div>
+        </div>
+
+        <div class="ctx-item">
+          <div class="ctx-item-left">
+            <span class="ctx-dot" style="background: #ea580c;"></span>
+            <span class="ctx-label">System tools</span>
+          </div>
+          <div class="ctx-item-right">
+            <span class="ctx-tokens" id="ctx-val-systools">--</span>
+            <span class="ctx-percent" id="ctx-pct-systools">--%</span>
+          </div>
+        </div>
+
+        <div class="ctx-item">
+          <div class="ctx-item-left">
+            <span class="ctx-dot" style="background: #10b981;"></span>
+            <span class="ctx-label">Memory files</span>
+          </div>
+          <div class="ctx-item-right">
+            <span class="ctx-tokens" id="ctx-val-memory">--</span>
+            <span class="ctx-percent" id="ctx-pct-memory">--%</span>
+          </div>
+        </div>
+
+        <div class="ctx-item">
+          <div class="ctx-item-left">
+            <span class="ctx-dot" style="background: #f59e0b;"></span>
+            <span class="ctx-label">MCP tools</span>
+          </div>
+          <div class="ctx-item-right">
+            <span class="ctx-tokens" id="ctx-val-mcp">--</span>
+            <span class="ctx-percent" id="ctx-pct-mcp">--%</span>
+          </div>
+        </div>
+
+        <div class="ctx-item">
+          <div class="ctx-item-left">
+            <span class="ctx-dot" style="background: #64748b;"></span>
+            <span class="ctx-label">Skills</span>
+          </div>
+          <div class="ctx-item-right">
+            <span class="ctx-tokens" id="ctx-val-skills">--</span>
+            <span class="ctx-percent" id="ctx-pct-skills">--%</span>
+          </div>
+        </div>
+
+        <div class="ctx-item">
+          <div class="ctx-item-left">
+            <span class="ctx-dot" style="background: #94a3b8;"></span>
+            <span class="ctx-label">System prompt</span>
+          </div>
+          <div class="ctx-item-right">
+            <span class="ctx-tokens" id="ctx-val-prompt">--</span>
+            <span class="ctx-percent" id="ctx-pct-prompt">--%</span>
+          </div>
+        </div>
+
+        <div class="ctx-item" title="安全预留缓冲区（业界通用 ~33k 警戒冗余，防止单次大响应导致上下文溢出报错）">
+          <div class="ctx-item-left">
+            <span class="ctx-dot" style="background: #cbd5e1;"></span>
+            <span class="ctx-label">Autocompact buffer <span style="font-size: 10px; color: var(--text-muted);">(预警冗余)</span></span>
+          </div>
+          <div class="ctx-item-right">
+            <span class="ctx-tokens" id="ctx-val-autocompact">--</span>
+            <span class="ctx-percent" id="ctx-pct-autocompact">--%</span>
+          </div>
+        </div>
+
+        <div class="ctx-item ctx-item-free">
+          <div class="ctx-item-left">
+            <span class="ctx-dot" style="background: #94a3b8; opacity: 0.3;"></span>
+            <span class="ctx-label">Free space</span>
+          </div>
+          <div class="ctx-item-right">
+            <span class="ctx-tokens" id="ctx-val-free">--</span>
+            <span class="ctx-percent" id="ctx-pct-free">--%</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Collapsible details for Memory files -->
+      <div class="ctx-sub-accordions">
+        <details class="ctx-details" id="ctx-details-memory">
+          <summary class="ctx-summary">
+            <span class="ctx-summary-title">📁 记忆文件</span>
+            <span class="ctx-summary-meta" id="ctx-summary-memory-meta">0 个</span>
+          </summary>
+          <div class="ctx-sub-list" id="ctx-list-memory"></div>
+        </details>
+      </div>
+    </section>
+
+    <!-- Card 2: Git Repository & Current Worktree -->
+    <section class="card" id="card-git">
+      <div class="card-header">
+        <div class="card-title">🌿 Git 仓库与代码状态</div>
+        <span id="git-status-badge" class="badge">检查中...</span>
+      </div>
+      <div id="git-content">
+        <div class="git-grid">
+          <div class="git-item">
+            <div class="git-item-label">当前分支</div>
+            <div id="git-branch" class="git-item-val">--</div>
+          </div>
+          <div class="git-item">
+            <div class="git-item-label">当前 Worktree</div>
+            <div id="git-worktree" class="git-item-val">--</div>
+          </div>
+        </div>
+
+        <div class="git-stats-row" id="git-stats-row">
+          <span class="git-stats-label">代码改动:</span>
+          <button type="button" id="stat-all" class="git-stat-badge stat-all active" title="显示全部改动文件">全部 0</button>
+          <button type="button" id="stat-staged" class="git-stat-badge stat-staged" title="只看暂存文件">暂存 0</button>
+          <button type="button" id="stat-modified" class="git-stat-badge stat-modified" title="只看修改文件">修改 0</button>
+          <button type="button" id="stat-untracked" class="git-stat-badge stat-untracked" title="只看未跟踪文件">未跟踪 0</button>
+        </div>
+
+        <div id="git-diff-summary" style="font-size: 11px; color: var(--text-muted); margin-top: 4px;"></div>
+        <div id="git-file-list" class="file-list"></div>
+      </div>
+    </section>
+
+    <!-- Card 3: Tool Calls -->
+    <section class="card">
+      <div class="card-header">
+        <div class="card-title">🛠️ 调用的工具</div>
+        <span id="tool-total-badge" class="badge">0 次</span>
+      </div>
+      <div id="tool-tags" class="tag-cloud" style="margin-bottom: 8px;"></div>
+      <div id="recent-tools" class="tool-timeline"></div>
+    </section>
+
+    <!-- Card 4: Skills & MCP -->
+    <section class="card">
+      <div class="card-header">
+        <div class="card-title">✨ 使用的 Skills & MCP</div>
+      </div>
+      <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">已触发 Skills:</div>
+      <div id="skills-cloud" class="tag-cloud" style="margin-bottom: 10px;">
+        <span style="font-size: 11px; color: var(--text-muted);">暂无</span>
+      </div>
+
+      <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">使用的 MCP 工具:</div>
+      <div id="mcp-cloud" class="tag-cloud">
+        <span style="font-size: 11px; color: var(--text-muted);">暂无外部 MCP 调用</span>
+      </div>
+    </section>
+
+    <!-- Card 5: Artifacts & Conversation ID -->
+    <section class="card">
+      <div class="card-header">
+        <div class="card-title">📦 会话产物与信息</div>
+        <span id="steps-badge" class="badge">0 步骤</span>
+      </div>
+      <div id="artifacts-list" class="artifacts-container"></div>
+      <div class="footer-info">
+        <span>会话 ID:</span>
+        <span id="conv-id-badge" class="id-badge" title="点击复制">--</span>
+      </div>
+    </section>
+
+    <!-- Image Lightbox Modal -->
+    <div id="image-modal" class="image-modal" style="display: none;" role="dialog" aria-modal="true">
+      <div class="image-modal-backdrop" id="image-modal-backdrop"></div>
+      <div class="image-modal-dialog">
+        <div class="image-modal-header">
+          <div class="image-modal-title-group">
+            <span class="image-modal-icon">🖼️</span>
+            <span class="image-modal-filename" id="modal-img-name">preview.png</span>
+            <span class="image-modal-filesize" id="modal-img-size">--</span>
+          </div>
+          <div class="image-modal-actions">
+            <button id="modal-btn-open-sys" class="modal-btn" title="在系统默认应用（如预览.app）中打开">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+              <span>系统打开</span>
+            </button>
+            <button id="modal-btn-copy" class="modal-btn" title="复制文件路径">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+              <span>复制路径</span>
+            </button>
+            <button id="modal-btn-close" class="modal-btn modal-btn-close" title="关闭 (Esc)">✕</button>
+          </div>
+        </div>
+        <div class="image-modal-body">
+          <div class="image-modal-loading" id="modal-img-loading">加载图片中...</div>
+          <img id="modal-img-preview" class="image-modal-img" src="" alt="图片预览" style="display: none;" />
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js?v=20261011i"></script>
+</body>
+</html>

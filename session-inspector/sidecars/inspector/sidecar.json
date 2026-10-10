@@ -1,0 +1,18 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "会话看板",
+  "description": "实时查看当前会话的 Token 消耗、速度、缓存命中、工具与技能调用及 Git 状态。",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "会话看板",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "会话看板"
+      }
+    ]
+  }
+}
